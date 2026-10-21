@@ -1,8 +1,11 @@
 package controller
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
@@ -16,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
 
@@ -33,8 +37,13 @@ type oauthFlowPayload struct {
 	AffiliateCode   string                         `json:"affiliate_code,omitempty"`
 	Verification    *service.OAuthVerificationFlow `json:"verification,omitempty"`
 	Telegram        *oauth.TelegramOAuthFlow       `json:"telegram,omitempty"`
+	OIDC            *oauth.OIDCOAuthFlow           `json:"oidc,omitempty"`
 	SessionIdentity *service.AuthIdentity          `json:"session_identity,omitempty"`
 	Authorization   *model.AuthFlowAuthorization   `json:"authorization,omitempty"`
+}
+
+func oidcBrowserCookieName(state string) string {
+	return fmt.Sprintf("__Host-newapi_oidc_%x", sha256.Sum256([]byte(state)))
 }
 
 // providerParams returns the params of messages that name the OAuth provider.
@@ -63,7 +72,17 @@ func GenerateOAuthCode(c *gin.Context) {
 	userID := 0
 	sessionID := ""
 	flowPayload := oauthFlowPayload{AffiliateCode: request.Aff}
+	var oidcBrowserToken string
 	bindingStarted := false
+	if request.Provider == "oidc" {
+		oidcBrowserToken = oauth2.GenerateVerifier()
+		oidcFlow, err := oauth.NewOIDCOAuthFlow(oidcBrowserToken)
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		flowPayload.OIDC = oidcFlow
+	}
 	if request.Provider == "telegram" {
 		telegramFlow, err := oauth.NewTelegramOAuthFlow()
 		if err != nil {
@@ -135,6 +154,16 @@ func GenerateOAuthCode(c *gin.Context) {
 	if flowPayload.Telegram != nil {
 		data["authorization_url"] = flowPayload.Telegram.AuthorizationURL(state)
 	}
+	if flowPayload.OIDC != nil {
+		authorizationURL, err := flowPayload.OIDC.AuthorizationURL(state)
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		data["authorization_url"] = authorizationURL
+		c.SetSameSite(http.SameSiteLaxMode)
+		c.SetCookie(oidcBrowserCookieName(state), oidcBrowserToken, int(oauthAuthFlowTTL.Seconds()), "/", "", true, true)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -160,6 +189,19 @@ func HandleOAuth(c *gin.Context) {
 	if err != nil {
 		writeAccountStatusError(c, http.StatusForbidden, "State parameter is empty or mismatched")
 		return
+	}
+	if providerName == "oidc" {
+		var payload oauthFlowPayload
+		cookieName := oidcBrowserCookieName(state)
+		browserToken, err := c.Cookie(cookieName)
+		if err != nil || common.UnmarshalJsonStr(pendingFlow.Payload, &payload) != nil || payload.OIDC == nil ||
+			!payload.OIDC.MatchesBrowser(browserToken) || !payload.OIDC.MatchesConfiguration() {
+			writeAccountStatusError(c, http.StatusForbidden, "State parameter is empty or mismatched")
+			return
+		}
+		c.SetSameSite(http.SameSiteLaxMode)
+		c.SetCookie(cookieName, "", -1, "/", "", true, true)
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), oauth.OIDCOAuthFlowContextKey, payload.OIDC))
 	}
 
 	consumeMatch := model.AuthFlowMatch{

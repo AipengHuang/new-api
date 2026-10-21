@@ -23,7 +23,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 import { api, type RefreshOutcome } from '@/lib/api'
 import type { AuthBundle } from '@/stores/auth-store'
 
-import { executeLogout } from './api'
+import { createOAuthAuthorization, executeLogout } from './api'
 import { useOAuthLogin } from './hooks/use-oauth-login'
 import { consumeOAuthLoginRedirect } from './lib/oauth-callback-mode'
 
@@ -85,6 +85,51 @@ test.each([true, false])(
     }
   }
 )
+
+test.each(['login', 'bind', 'verify'] as const)(
+  'rejects OIDC %s when the server omits its PKCE authorization URL',
+  async (intent) => {
+    vi.spyOn(api, 'post').mockResolvedValue({
+      data: { success: true, data: { flow_token: 'oidc-state' } },
+    })
+    await expect(createOAuthAuthorization('oidc', intent)).rejects.toThrow(
+      'Failed to initialize OAuth'
+    )
+  }
+)
+
+test('starts OIDC login with the server PKCE URL and retains the destination', async () => {
+  vi.spyOn(window, 'localStorage', 'get').mockReturnValue(window.sessionStorage)
+  const authorizationUrl =
+    'https://identity.example/authorize?code_challenge=server-challenge&code_challenge_method=S256'
+  vi.spyOn(api, 'post').mockImplementation(async (url) => ({
+    data: {
+      success: true,
+      ...(url === '/api/oauth/state'
+        ? {
+            data: {
+              flow_token: 'oidc-state',
+              authorization_url: authorizationUrl,
+            },
+          }
+        : {}),
+    },
+  }))
+  const open = vi.spyOn(window, 'open').mockReturnValue(null)
+  const { result } = renderHook(() =>
+    useOAuthLogin(
+      {
+        oidc_enabled: true,
+        oidc_client_id: 'client',
+        oidc_authorization_endpoint: 'https://identity.example/authorize',
+      },
+      '/console/personal'
+    )
+  )
+  await act(() => result.current.handleOIDCLogin())
+  expect(open).toHaveBeenCalledWith(authorizationUrl, '_self')
+  expect(consumeOAuthLoginRedirect('oidc-state')).toBe('/console/personal')
+})
 
 const bundle: AuthBundle = {
   access_token: 'access-token',
